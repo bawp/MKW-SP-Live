@@ -146,6 +146,15 @@ Copy-Item -LiteralPath (Join-Path $Files 'nand\contents.arc') -Destination (Join
 # The MKW-SP Channel's buttons as the Mario Kart Channel's (icons included), made from your own disc's
 # Channel.szs; it needs xz (Git for Windows has it), else the channel keeps MKW-SP's buttons.
 Remove-Item -LiteralPath (Join-Path $titleData 'contents.arc.pre-rankings') -ErrorAction SilentlyContinue
+# Git for Windows only puts Git\cmd on PATH; its xz is in mingw64\bin (or usr\bin)
+if (-not (Get-Command xz -ErrorAction SilentlyContinue)) {
+    $gitRoots = @("$env:ProgramFiles\Git", "${env:ProgramFiles(x86)}\Git", "$env:LOCALAPPDATA\Programs\Git")
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($git) { $gitRoots = @(Split-Path -Parent (Split-Path -Parent $git.Source)) + $gitRoots }
+    foreach ($bin in $gitRoots | ForEach-Object { "$_\mingw64\bin"; "$_\usr\bin" }) {
+        if (Test-Path -LiteralPath (Join-Path $bin 'xz.exe')) { $env:Path = "$bin;$env:Path"; break }
+    }
+}
 if (Get-Command xz -ErrorAction SilentlyContinue) {
     $ErrorActionPreference = 'Continue'   # stderr lines are not failures (see Run)
     & node (Join-Path $Files 'tools\rankings-ui.js') (Join-Path $titleData 'contents.arc') *> (Join-Path $logs 'channel-buttons.log')
