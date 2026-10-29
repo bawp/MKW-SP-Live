@@ -17,6 +17,8 @@ your own WiiCompiled install and your own copy of Mario Kart Wii (PAL, RMCP01).
 
 ## Playing it
 
+## NOTHING IS TESTED, USE AT YOUR OWN RISK
+
 Download the latest kit from [Releases](../../releases) and follow its `README.txt`. In short:
 
 1. Install WiiCompiled 0.9.2 with your own Mario Kart Wii disc (PAL / European) and
