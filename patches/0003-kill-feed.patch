@@ -1,0 +1,878 @@
+diff --git a/runtime/include/kill_feed.h b/runtime/include/kill_feed.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/kill_feed.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++// Valorant-style kill feed for MKW-SP: "attacker [item silhouette] victim" rows in the top-right
++// corner of the race, below the timer and lap counter. Toggled by MKW-SP's Settings > Race > Kill Feed.
++namespace kill_feed {
++// Turns MKW-SP's unused RoomCodeLow setting into "Race > Kill Feed". Must run after the payload's
++// static constructors built SP::ClientSettings::entries and before the game reads settings.ini,
++// i.e. from the StaticR prolog hook.
++void InstallSettingEntry() noexcept;
++// Draws the feed into the current ImGui frame (settings_overlay::Draw, guest thread).
++void Draw() noexcept;
++} // namespace kill_feed
+diff --git a/runtime/src/kill_feed.cpp b/runtime/src/kill_feed.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/kill_feed.cpp
+@@ -0,0 +1,856 @@
++// Valorant-style kill feed for MKW-SP (see kill_feed.h).
++//
++// Hit detection: the game counts item hits for its license statistics through a few leaf
++// functions, called right where a hit lands. Those are reimplemented natively here (same
++// register effects), and the call site (ctx->lr) plus the caller's registers, which are still in
++// the context at entry, say who hit whom with what:
++//   * 0x807A2234  item-object flag lookup, called by Kart::Collision::CheckItemCollision once
++//                 Damage::SetDamage accepted the hit: r23 = item owner, r24 = victim, r3 = ItemObj
++//                 (shells, bananas, fake boxes, bombs, blue shells, ...).
++//   * 0x805918BC  Kart::Link::IncrementItemsHitCount (attacker side) and
++//   * 0x805918E0  Kart::Link::IncrementItemsCollisionCount (victim side): star / Mega / Bullet
++//                 bumps in CheckKartCollision (lightning, POW, blooper and thunder cloud are left out).
++// Player names, teams and the local player come from RaceConfig; the item silhouettes are cut
++// from the game's own item icons in Scene/UI/Race.szs.
++
++#include "kill_feed.h"
++
++#include "abi_bridge.h"
++#include "hle_stubs.h"
++#include "memory.h"
++#include "runtime_config.h"
++
++#include <aurora/imgui.h>
++#include <dolphin/gx/GXAurora.h>
++#include <imgui.h>
++
++#include <algorithm>
++#include <array>
++#include <cfloat>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <mutex>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++// ---------------------------------------------------------------------------------------------
++// Guest layout (PAL, vanilla REL layout; MKW-SP payload addresses are link address + kPayloadShift,
++// see tools/convert.js)
++
++constexpr uint32_t kRaceConfigInstance = 0x809BD728;   // System::RaceConfig::s_instance
++constexpr uint32_t kRaceInfoInstance = 0x809BD730;     // RaceManager / Raceinfo, null outside races
++constexpr uint32_t kSaveManagerInstance = 0x809BD748;  // System::SaveManager::s_instance
++constexpr uint32_t kRaceConfigPlayers = 0x28;          // RaceConfig::raceScenario.players[]
++constexpr uint32_t kPlayerSize = 0xF0;
++constexpr uint32_t kPlayerCharacter = 0x0C;
++constexpr uint32_t kPlayerType = 0x10;                  // 0 local, 1 CPU, 3 ghost, 4 online, 5 none
++constexpr uint32_t kPlayerMiiName = 0x14 + 0x68;        // Player::mii (System::Mii), Mii::name()
++constexpr uint32_t kPlayerTeam = 0xCC;                  // 2 = no team
++constexpr uint32_t kMaxPlayers = 12;
++constexpr uint32_t kNoTeam = 2;
++
++constexpr uint32_t kPayloadShift = 0x010A0000;
++constexpr uint32_t kSettingEntries = 0x80850048 + kPayloadShift;  // SP::ClientSettings::entries[67]
++constexpr uint32_t kSettingEntrySize = 52;
++constexpr uint32_t kVanillaModeSetting = 3;
++constexpr uint32_t kRoomCodeLowSetting = 54;   // becomes Kill Feed (index in this MKW-SP build)
++constexpr uint32_t kSettingCount = 67;
++// SaveManager: per-license setting values (u32[67] per license), current license, license loaded
++constexpr uint32_t kSaveSettingValues = 0x2500C;
++constexpr uint32_t kSaveCurrentLicense = 0x25654;
++constexpr uint32_t kSaveLicenseLoaded = 0x25655;
++// tools/convert.js "kill feed data block": magic, explanation message IDs[2], title message ID, name
++constexpr uint32_t kDataBlock = 0x81962D80;
++constexpr uint32_t kDataMagic = 0x4B464431;  // 'KFD1'
++
++// ---------------------------------------------------------------------------------------------
++// Items. The order matches the game's ItemObj type IDs (ItemObj+0x4).
++
++enum class Item : uint8_t {
++    GreenShell, RedShell, Banana, Mushroom, Star, BlueShell, Lightning, FakeBox, Mega, Bomb,
++    Blooper, Pow, GoldenMushroom, Bullet, ThunderCloud, Count
++};
++constexpr size_t kItemCount = static_cast<size_t>(Item::Count);
++constexpr std::array<const char*, kItemCount> kIconFiles = {
++    "tt_item_kame_green.tpl", "tt_item_kame_red.tpl", "tt_item_banana.tpl", "tt_item_kinoko.tpl",
++    "tt_item_star.tpl", "tt_item_kame_wing.tpl", "tt_item_thunder.tpl", "tt_item_dummybox.tpl",
++    "fm_item_kinoko_l.tpl", "tt_item_bomb_hei.tpl", "fm_item_gesso.tpl", "fm_item_pow.tpl",
++    "tt_item_GoldenKinoko.tpl", "tt_item_killer.tpl", "fm_item_pikakumo.tpl",
++};
++
++// ---------------------------------------------------------------------------------------------
++// Hit sites (return addresses into the game)
++
++// Kart::Collision::CheckKartCollision: the two karts are r31 and r30+4 (Kart::Link). Which tier
++// the bump came from is fixed per site; the damage type it applies (Damage::SetDamage r4) is
++// 6 = ApplyBulletDamage, 3 = ApplyStarDamage, 13 = ApplyMegaDamage.
++struct KartBumpSite {
++    uint32_t lr;
++    Item item;
++};
++constexpr KartBumpSite kKartBumpSites[] = {
++    {0x8056FF2C, Item::Bullet}, {0x8056FFB0, Item::Bullet},
++    {0x805701FC, Item::Star},   {0x80570390, Item::Star},
++    {0x80570594, Item::Mega},   {0x8057071C, Item::Mega},
++};
++
++// Not shown in the feed: lightning, POW, blooper and thunder cloud (they also count as item hits),
++// plus calls already covered by another hook (the other half of a pair, the item-object path).
++constexpr std::array<Item, 4> kHiddenItems = {Item::Lightning, Item::Pow, Item::Blooper, Item::ThunderCloud};
++constexpr uint32_t kItemObjectHitLr = 0x805727C8;    // CheckItemCollision -> 0x807A2234
++constexpr uint32_t kKnownLrs[] = {
++    0x8057280C,                                                          // item object, victim
++    0x8056FF24, 0x8056FFB8, 0x805701F4, 0x80570398, 0x8057058C, 0x80570724,  // kart bumps, victim
++    0x807B7D60, 0x807987D0,                                              // lightning (hidden)
++    0x807B2458, 0x80581378,                                              // POW (hidden)
++    0x807A948C, 0x80581B04,                                              // blooper ink (hidden)
++    0x807AF724, 0x807AFD74, 0x807AFF18, 0x807AF738, 0x807AFD88, 0x807AFF2C,  // thunder cloud (hidden)
++};
++constexpr uint32_t kHitDeliveredLr = 0x807D19E0;     // 0x807D19C8 (owner's "hit someone" reaction)
++constexpr uint32_t kHitDeliveredItemObjectLr = 0x80572AC8;
++
++// ---------------------------------------------------------------------------------------------
++// Feed state
++
++enum class Tint : uint8_t { Ally, Enemy, Neutral };
++
++struct Side {
++    std::string text;
++    Tint tint = Tint::Neutral;
++    bool local = false;
++};
++
++struct Entry {
++    uint64_t id = 0;
++    Item item = Item::GreenShell;
++    bool hasAttacker = false;
++    Side attacker;
++    Side victim;
++    Clock::time_point born;
++};
++
++constexpr auto kEntryLifetime = std::chrono::milliseconds(6000);
++constexpr auto kFadeOut = std::chrono::milliseconds(500);
++constexpr auto kSlideIn = std::chrono::milliseconds(180);
++constexpr size_t kMaxEntries = 6;
++
++std::mutex g_mutex;
++std::deque<Entry> g_entries;
++uint64_t g_nextId = 1;
++bool g_settingInstalled = false;
++
++// ---------------------------------------------------------------------------------------------
++// Guest helpers
++
++uint32_t ProxyPlayerIdx(uint32_t proxy) {
++    // KartObjectProxy -> accessor -> KartSettings::playerIdx (Kart::Link::GetPlayerIdx)
++    return Memory::Read8(Memory::Read32(Memory::Read32(proxy)) + 0x10);
++}
++
++std::string Utf16BeToUtf8(uint32_t address, size_t maxChars) {
++    std::string out;
++    for (size_t i = 0; i < maxChars; ++i) {
++        uint32_t c = Memory::Read16(address + static_cast<uint32_t>(i * 2));
++        if (c == 0) {
++            break;
++        }
++        if (c >= 0xD800 && c <= 0xDFFF) {
++            c = '?';
++        }
++        if (c < 0x80) {
++            out.push_back(static_cast<char>(c));
++        } else if (c < 0x800) {
++            out.push_back(static_cast<char>(0xC0 | (c >> 6)));
++            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
++        } else {
++            out.push_back(static_cast<char>(0xE0 | (c >> 12)));
++            out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
++            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
++        }
++    }
++    return out;
++}
++
++constexpr std::array<const char*, 24> kCharacterNames = {
++    "Mario", "Baby Peach", "Waluigi", "Bowser", "Baby Daisy", "Dry Bones", "Baby Mario", "Luigi",
++    "Toad", "Donkey Kong", "Yoshi", "Wario", "Baby Luigi", "Toadette", "Koopa Troopa", "Daisy",
++    "Peach", "Birdo", "Diddy Kong", "King Boo", "Bowser Jr.", "Dry Bowser", "Funky Kong", "Rosalina",
++};
++
++struct PlayerInfo {
++    bool valid = false;
++    std::string name;
++    bool local = false;
++    bool cpu = false;
++    uint32_t team = kNoTeam;
++};
++
++PlayerInfo ReadPlayer(uint32_t idx) {
++    PlayerInfo info;
++    if (idx >= kMaxPlayers) {
++        return info;
++    }
++    try {
++        const uint32_t raceConfig = Memory::Read32(kRaceConfigInstance);
++        if (raceConfig == 0) {
++            return info;
++        }
++        const uint32_t player = raceConfig + kRaceConfigPlayers + idx * kPlayerSize;
++        const uint32_t type = Memory::Read32(player + kPlayerType);
++        if (type == 5) {
++            return info;
++        }
++        const uint32_t character = Memory::Read32(player + kPlayerCharacter);
++        info.valid = true;
++        info.local = type == 0;
++        info.cpu = type == 1;
++        info.team = Memory::Read32(player + kPlayerTeam);
++        if (type != 1) {
++            info.name = Utf16BeToUtf8(player + kPlayerMiiName, 10);
++        }
++        if (info.name.empty()) {
++            info.name = character < kCharacterNames.size() ? kCharacterNames[character] : "Mii";
++        }
++    } catch (const Memory::AccessViolation&) {
++        info = PlayerInfo{};
++    }
++    return info;
++}
++
++// "Ally" means a local player or a local player's teammate, as Valorant colours your team.
++std::array<PlayerInfo, kMaxPlayers> ReadRoster(uint32_t& localTeam) {
++    std::array<PlayerInfo, kMaxPlayers> roster;
++    localTeam = kNoTeam;
++    for (uint32_t i = 0; i < kMaxPlayers; ++i) {
++        roster[i] = ReadPlayer(i);
++        if (roster[i].valid && roster[i].local && localTeam == kNoTeam) {
++            localTeam = roster[i].team;
++        }
++    }
++    return roster;
++}
++
++// One local racer and every other racer a CPU (single-player VS / battle).
++bool IsSinglePlayerVsCpus(const std::array<PlayerInfo, kMaxPlayers>& roster) {
++    int locals = 0;
++    for (const PlayerInfo& p : roster) {
++        if (!p.valid) continue;
++        if (p.local) ++locals;
++        else if (!p.cpu) return false;
++    }
++    return locals == 1;
++}
++
++Tint TintFor(const PlayerInfo& player, uint32_t localTeam) {
++    if (player.local || (localTeam != kNoTeam && player.team == localTeam)) {
++        return Tint::Ally;
++    }
++    return Tint::Enemy;
++}
++
++bool ReadSettingEnabled() {
++    if (!g_settingInstalled) {
++        return true;  // no toggle could be installed: keep the feed on
++    }
++    try {
++        const uint32_t entry = kSettingEntries + kRoomCodeLowSetting * kSettingEntrySize;
++        const uint32_t saveManager = Memory::Read32(kSaveManagerInstance);
++        if (saveManager == 0 || Memory::Read8(saveManager + kSaveLicenseLoaded) == 0) {
++            return Memory::Read32(entry + 16) != 0;  // default value
++        }
++        const uint32_t license = Memory::Read8(saveManager + kSaveCurrentLicense);
++        return Memory::Read32(saveManager + kSaveSettingValues + (license * kSettingCount + kRoomCodeLowSetting) * 4) != 0;
++    } catch (const Memory::AccessViolation&) {
++        return true;
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Recording (guest thread, from the hooks below). Every hit is its own row: a bomb or blue shell
++// that catches three racers produces three rows with the same attacker.
++
++void AddEntry(uint32_t attacker, uint32_t victim, Item item) {
++    if (!ReadSettingEnabled()) {
++        return;
++    }
++    uint32_t localTeam = kNoTeam;
++    const auto roster = ReadRoster(localTeam);
++    if (victim >= kMaxPlayers || !roster[victim].valid) {
++        return;
++    }
++    // Single player against CPUs: only hits involving you, no CPU-on-CPU rows.
++    if (IsSinglePlayerVsCpus(roster) && !roster[victim].local && !(attacker < kMaxPlayers && roster[attacker].local)) {
++        return;
++    }
++    Entry entry;
++    entry.id = g_nextId++;
++    entry.item = item;
++    entry.born = Clock::now();
++    // A self hit (own banana, own shell bouncing back) shows like a Valorant environment death.
++    entry.hasAttacker = attacker < kMaxPlayers && roster[attacker].valid && attacker != victim;
++    if (entry.hasAttacker) {
++        entry.attacker.text = roster[attacker].name;
++        entry.attacker.tint = TintFor(roster[attacker], localTeam);
++        entry.attacker.local = roster[attacker].local;
++    }
++    entry.victim.text = roster[victim].name;
++    entry.victim.tint = TintFor(roster[victim], localTeam);
++    entry.victim.local = roster[victim].local;
++
++    std::lock_guard lock(g_mutex);
++    g_entries.push_back(std::move(entry));
++    while (g_entries.size() > kMaxEntries * 2) {
++        g_entries.pop_front();
++    }
++}
++
++void LogUnclassified(const char* what, uint32_t lr) {
++    static std::set<uint32_t> logged;
++    if (logged.insert(lr).second) {
++        std::cout << "[killfeed] unclassified " << what << " call from 0x" << std::hex << lr << std::dec
++                  << " (not shown in the feed)" << std::endl;
++    }
++}
++
++bool IsKnownLr(uint32_t lr) {
++    return std::find(std::begin(kKnownLrs), std::end(kKnownLrs), lr) != std::end(kKnownLrs);
++}
++
++void OnHitDelivered(const CpuContext* ctx, uint32_t proxy) {
++    const uint32_t lr = ctx->lr;
++    for (const KartBumpSite& site : kKartBumpSites) {
++        if (site.lr == lr) {
++            const uint32_t victimProxy = proxy == ctx->gpr[31] ? ctx->gpr[30] + 4 : ctx->gpr[31];
++            AddEntry(ProxyPlayerIdx(proxy), ProxyPlayerIdx(victimProxy), site.item);
++            return;
++        }
++    }
++    if (IsKnownLr(lr)) {
++        return;
++    }
++    if (lr == kHitDeliveredLr) {
++        // 0x807D19C8 saved its caller's return address at 20(r1) and has not touched r1 since.
++        const uint32_t outer = Memory::Read32(ctx->gpr[1] + 20);
++        if (outer != kHitDeliveredItemObjectLr) {
++            LogUnclassified("hit-delivered", outer);
++        }
++        return;
++    }
++    LogUnclassified("IncrementItemsHitCount", lr);
++}
++
++void OnHitReceived(const CpuContext* ctx, uint32_t) {
++    if (!IsKnownLr(ctx->lr)) {
++        LogUnclassified("IncrementItemsCollisionCount", ctx->lr);
++    }
++}
++
++void SetCr0Signed(CpuContext* ctx, int32_t value) {
++    uint32_t field = value < 0 ? 0x8 : value > 0 ? 0x4 : 0x2;
++    if (ctx->xer & 0x80000000u) {
++        field |= 0x1;
++    }
++    ctx->cr = (ctx->cr & 0x0FFFFFFFu) | (field << 28);
++}
++
++// Kart::Link::IncrementItemsHitCount / IncrementItemsCollisionCount body:
++//   lwz r3,0(r3); lwz r3,0(r3); lwz r4,56(r3); cmpwi r4,0; beqlr; lwz r3,off(r4); addi r0,r3,1; stw r0,off(r4)
++void IncrementItemStat(CpuContext* ctx, uint32_t offset) {
++    uint32_t r3 = Memory::Read32(Memory::Read32(ctx->gpr[3]));
++    const uint32_t r4 = Memory::Read32(r3 + 56);
++    ctx->gpr[3] = r3;
++    ctx->gpr[4] = r4;
++    SetCr0Signed(ctx, static_cast<int32_t>(r4));
++    if (r4 == 0) {
++        return;
++    }
++    r3 = Memory::Read32(r4 + offset);
++    const uint32_t r0 = r3 + 1;
++    Memory::Write32(r4 + offset, r0);
++    ctx->gpr[3] = r3;
++    ctx->gpr[0] = r0;
++}
++
++template <typename Fn>
++void Guarded(Fn&& fn) noexcept {
++    try {
++        fn();
++    } catch (const Memory::AccessViolation& e) {
++        std::cout << "[killfeed] ignored a hit: guest read failed at 0x" << std::hex << e.address() << std::dec << std::endl;
++    } catch (...) {
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Resources: font atlas and item silhouettes (created lazily on the guest thread inside Draw)
++
++ImFontAtlas* g_fontAtlas = nullptr;
++ImFont* g_font = nullptr;
++bool g_fontTried = false;
++ImTextureID g_iconTexture{};
++bool g_iconsTried = false;
++std::array<bool, kItemCount> g_iconLoaded{};
++constexpr int kIconSize = 64;
++constexpr int kIconAtlasWidth = kIconSize * 16;
++
++void LoadFont() {
++    g_fontTried = true;
++    std::vector<std::filesystem::path> candidates;
++#ifdef _WIN32
++    const char* windir = std::getenv("WINDIR");
++    const std::filesystem::path fonts = std::filesystem::path(windir ? windir : "C:\\Windows") / "Fonts";
++    // Bahnschrift is a DIN face, the closest stock match to Valorant's HUD font.
++    candidates = {fonts / "bahnschrift.ttf", fonts / "segoeuib.ttf", fonts / "arialbd.ttf"};
++#else
++    candidates = {"/System/Library/Fonts/Supplemental/Arial Bold.ttf",
++                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"};
++#endif
++    static const ImWchar kRanges[] = {0x0020, 0x00FF, 0x0100, 0x017F, 0x2010, 0x205E, 0};
++    for (const auto& path : candidates) {
++        std::error_code ec;
++        if (!std::filesystem::exists(path, ec)) {
++            continue;
++        }
++        auto* atlas = IM_NEW(ImFontAtlas)();
++        ImFontConfig config;
++        config.OversampleH = 2;
++        config.OversampleV = 2;
++        config.RasterizerMultiply = 1.15f;
++        ImFont* font = atlas->AddFontFromFileTTF(path.string().c_str(), 48.0f, &config, kRanges);
++        unsigned char* pixels = nullptr;
++        int width = 0, height = 0;
++        if (font == nullptr || !atlas->Build()) {
++            IM_DELETE(atlas);
++            continue;
++        }
++        atlas->GetTexDataAsRGBA32(&pixels, &width, &height);
++        const ImTextureID texture = aurora_imgui_add_texture(static_cast<uint32_t>(width), static_cast<uint32_t>(height), pixels);
++        if (!texture) {
++            IM_DELETE(atlas);
++            continue;
++        }
++        atlas->SetTexID(texture);
++        atlas->ClearTexData();
++        g_fontAtlas = atlas;
++        g_font = font;
++        std::cout << "[killfeed] font: " << path.string() << std::endl;
++        return;
++    }
++    std::cout << "[killfeed] no TrueType font found; using the overlay font" << std::endl;
++}
++
++uint32_t Be32(const std::vector<uint8_t>& b, size_t o) {
++    return (uint32_t(b[o]) << 24) | (uint32_t(b[o + 1]) << 16) | (uint32_t(b[o + 2]) << 8) | b[o + 3];
++}
++uint16_t Be16(const std::vector<uint8_t>& b, size_t o) {
++    return static_cast<uint16_t>((b[o] << 8) | b[o + 1]);
++}
++
++bool Yaz0Decompress(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
++    if (in.size() < 16 || std::memcmp(in.data(), "Yaz0", 4) != 0) {
++        out = in;
++        return true;
++    }
++    const uint32_t size = Be32(in, 4);
++    out.assign(size, 0);
++    size_t src = 16, dst = 0;
++    while (dst < size) {
++        if (src >= in.size()) {
++            return false;
++        }
++        uint8_t code = in[src++];
++        for (int bit = 0; bit < 8 && dst < size; ++bit, code <<= 1) {
++            if (code & 0x80) {
++                if (src >= in.size()) return false;
++                out[dst++] = in[src++];
++                continue;
++            }
++            if (src + 1 >= in.size()) return false;
++            const uint8_t b1 = in[src++], b2 = in[src++];
++            const size_t dist = (((b1 & 0x0F) << 8) | b2) + 1;
++            size_t length = b1 >> 4;
++            if (length == 0) {
++                if (src >= in.size()) return false;
++                length = in[src++] + 0x12;
++            } else {
++                length += 2;
++            }
++            if (dist > dst) return false;
++            for (size_t k = 0; k < length && dst < size; ++k, ++dst) {
++                out[dst] = out[dst - dist];
++            }
++        }
++    }
++    return true;
++}
++
++// Finds a file by its base name in a U8 archive.
++bool U8Find(const std::vector<uint8_t>& arc, std::string_view name, size_t& offset, size_t& length) {
++    if (arc.size() < 0x20 || Be32(arc, 0) != 0x55AA382D) {
++        return false;
++    }
++    const uint32_t root = Be32(arc, 4);
++    if (root + 12 > arc.size()) return false;
++    const uint32_t count = Be32(arc, root + 8);
++    const size_t strings = root + size_t(count) * 12;
++    if (strings > arc.size()) return false;
++    for (uint32_t i = 1; i < count; ++i) {
++        const size_t node = root + size_t(i) * 12;
++        if (arc[node] != 0) continue;  // directory
++        const size_t nameOffset = strings + ((arc[node + 1] << 16) | (arc[node + 2] << 8) | arc[node + 3]);
++        if (nameOffset >= arc.size()) continue;
++        const char* nodeName = reinterpret_cast<const char*>(arc.data() + nameOffset);
++        if (std::string_view(nodeName, strnlen(nodeName, arc.size() - nameOffset)) == name) {
++            offset = Be32(arc, node + 4);
++            length = Be32(arc, node + 8);
++            return offset + length <= arc.size();
++        }
++    }
++    return false;
++}
++
++// RGB5A3 64x64 TPL -> RGBA8.
++bool DecodeIcon(const std::vector<uint8_t>& arc, size_t offset, size_t length, std::vector<uint8_t>& rgba) {
++    if (length < 0x40 || Be32(arc, offset) != 0x0020AF30) return false;
++    const size_t header = offset + Be32(arc, offset + Be32(arc, offset + 8));
++    const int height = Be16(arc, header), width = Be16(arc, header + 2);
++    const uint32_t format = Be32(arc, header + 4);
++    const size_t data = offset + Be32(arc, header + 8);
++    if (width != kIconSize || height != kIconSize || format != 5 || data + kIconSize * kIconSize * 2 > offset + length) {
++        return false;
++    }
++    rgba.assign(kIconSize * kIconSize * 4, 0);
++    size_t p = data;
++    for (int by = 0; by < kIconSize; by += 4) {
++        for (int bx = 0; bx < kIconSize; bx += 4) {
++            for (int y = 0; y < 4; ++y) {
++                for (int x = 0; x < 4; ++x, p += 2) {
++                    const uint16_t v = Be16(arc, p);
++                    uint8_t r, g, b, a;
++                    if (v & 0x8000) {
++                        r = uint8_t(((v >> 10) & 31) * 255 / 31);
++                        g = uint8_t(((v >> 5) & 31) * 255 / 31);
++                        b = uint8_t((v & 31) * 255 / 31);
++                        a = 255;
++                    } else {
++                        a = uint8_t(((v >> 12) & 7) * 255 / 7);
++                        r = uint8_t(((v >> 8) & 15) * 17);
++                        g = uint8_t(((v >> 4) & 15) * 17);
++                        b = uint8_t((v & 15) * 17);
++                    }
++                    uint8_t* out = &rgba[((by + y) * kIconSize + bx + x) * 4];
++                    out[0] = r; out[1] = g; out[2] = b; out[3] = a;
++                }
++            }
++        }
++    }
++    return true;
++}
++
++// Flat white silhouette from the icon's alpha, Valorant style.
++void Silhouette(const std::vector<uint8_t>& rgba, uint8_t* out, int stride) {
++    for (int y = 0; y < kIconSize; ++y) {
++        for (int x = 0; x < kIconSize; ++x) {
++            uint8_t* px = out + (y * stride + x) * 4;
++            px[0] = px[1] = px[2] = 255;
++            px[3] = rgba[(y * kIconSize + x) * 4 + 3];
++        }
++    }
++}
++
++void LoadIcons() {
++    g_iconsTried = true;
++    const std::filesystem::path root = RuntimeConfigFile::ResolvedDvdRoot();
++    std::vector<uint8_t> file;
++    for (const auto& candidate : {root / "files" / "Scene" / "UI" / "Race.szs", root / "Scene" / "UI" / "Race.szs"}) {
++        std::ifstream in(candidate, std::ios::binary);
++        if (in) {
++            file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++            break;
++        }
++    }
++    std::vector<uint8_t> arc;
++    if (file.empty() || !Yaz0Decompress(file, arc)) {
++        std::cout << "[killfeed] Scene/UI/Race.szs not found under the dvd_root; item icons disabled" << std::endl;
++        return;
++    }
++    std::vector<uint8_t> atlas(size_t(kIconAtlasWidth) * kIconSize * 4, 0);
++    std::vector<uint8_t> rgba;
++    size_t loaded = 0;
++    for (size_t i = 0; i < kItemCount; ++i) {
++        size_t offset = 0, length = 0;
++        if (!U8Find(arc, kIconFiles[i], offset, length) || !DecodeIcon(arc, offset, length, rgba)) {
++            continue;
++        }
++        Silhouette(rgba, &atlas[i * kIconSize * 4], kIconAtlasWidth);
++        g_iconLoaded[i] = true;
++        ++loaded;
++    }
++    if (loaded != 0) {
++        g_iconTexture = aurora_imgui_add_texture(kIconAtlasWidth, kIconSize, atlas.data());
++    }
++    std::cout << "[killfeed] " << loaded << "/" << kItemCount << " item silhouettes loaded" << std::endl;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Drawing
++
++ImU32 TintColor(Tint tint, float alpha) {
++    // Valorant: your team teal-green, the enemy red.
++    switch (tint) {
++    case Tint::Ally: return IM_COL32(56, 196, 166, static_cast<int>(alpha * 255));
++    case Tint::Enemy: return IM_COL32(222, 72, 84, static_cast<int>(alpha * 255));
++    default: return IM_COL32(120, 120, 132, static_cast<int>(alpha * 255));
++    }
++}
++
++ImVec2 MeasureText(float size, const std::string& text) {
++    ImFont* font = g_font ? g_font : ImGui::GetFont();
++    return font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
++}
++
++void DrawText(ImDrawList* list, float size, ImVec2 pos, float alpha, const std::string& text) {
++    ImFont* font = g_font ? g_font : ImGui::GetFont();
++    if (g_font) list->PushTextureID(g_fontAtlas->TexID);
++    list->AddText(font, size, ImVec2(pos.x + 1.0f, pos.y + 1.5f), IM_COL32(0, 0, 0, static_cast<int>(alpha * 150)), text.c_str());
++    list->AddText(font, size, pos, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)), text.c_str());
++    if (g_font) list->PopTextureID();
++}
++
++// The rectangle the game image occupies in the window (letter/pillarboxed when its aspect differs).
++void GameRect(ImVec2& origin, ImVec2& size) {
++    const ImGuiIO& io = ImGui::GetIO();
++    u32 renderWidth = 0, renderHeight = 0;
++    AuroraGetRenderSize(&renderWidth, &renderHeight);
++    float aspect = renderWidth && renderHeight ? float(renderWidth) / float(renderHeight)
++                                               : io.DisplaySize.x / std::max(1.0f, io.DisplaySize.y);
++    size = io.DisplaySize;
++    if (size.x / std::max(1.0f, size.y) > aspect) {
++        size.x = size.y * aspect;
++    } else {
++        size.y = size.x / aspect;
++    }
++    origin = ImVec2((io.DisplaySize.x - size.x) * 0.5f, (io.DisplaySize.y - size.y) * 0.5f);
++}
++
++float Smooth(float t) {
++    t = std::clamp(t, 0.0f, 1.0f);
++    return t * t * (3.0f - 2.0f * t);
++}
++
++void DrawEntry(ImDrawList* list, const Entry& entry, float right, float top, float rowHeight, Clock::time_point now) {
++    const float age = std::chrono::duration<float>(now - entry.born).count();
++    const float lifetime = std::chrono::duration<float>(kEntryLifetime).count();
++    const float fade = std::chrono::duration<float>(kFadeOut).count();
++    const float slide = Smooth(age / std::chrono::duration<float>(kSlideIn).count());
++    const float alpha = slide * Smooth((lifetime - age) / fade);
++    if (alpha <= 0.0f) return;
++
++    const float textSize = rowHeight * 0.56f;
++    const float pad = rowHeight * 0.36f;
++    const float iconSize = rowHeight * 0.86f;
++    const float iconSlot = iconSize + pad;
++    const float attackerWidth = entry.hasAttacker ? MeasureText(textSize, entry.attacker.text).x + pad * 2.0f : pad * 0.5f;
++    const float victimWidth = entry.victim.text.empty() ? pad * 0.5f : MeasureText(textSize, entry.victim.text).x + pad * 2.0f;
++    const float width = attackerWidth + iconSlot + victimWidth;
++    const float x0 = right - width + (1.0f - slide) * rowHeight * 2.0f;
++    const float x1 = x0 + width;
++    const float y0 = top, y1 = top + rowHeight;
++    const float split = x0 + attackerWidth + iconSlot * 0.5f;
++
++    list->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(12, 12, 18, static_cast<int>(alpha * 120)));
++    if (entry.hasAttacker) {
++        list->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(split, y1),
++                                      TintColor(entry.attacker.tint, alpha * 0.92f), TintColor(entry.attacker.tint, alpha * 0.40f),
++                                      TintColor(entry.attacker.tint, alpha * 0.40f), TintColor(entry.attacker.tint, alpha * 0.92f));
++    }
++    if (!entry.victim.text.empty()) {
++        list->AddRectFilledMultiColor(ImVec2(split, y0), ImVec2(x1, y1),
++                                      TintColor(entry.victim.tint, alpha * 0.40f), TintColor(entry.victim.tint, alpha * 0.92f),
++                                      TintColor(entry.victim.tint, alpha * 0.92f), TintColor(entry.victim.tint, alpha * 0.40f));
++    }
++    // Your own hits get Valorant's outline and edge marker, in the yellow of MKW's timer/lap digits.
++    if (entry.attacker.local || (!entry.hasAttacker && entry.victim.local)) {
++        const float stroke = std::max(1.0f, rowHeight * 0.05f);
++        list->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(255, 222, 40, static_cast<int>(alpha * 235)), 0.0f, 0, stroke);
++        list->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + stroke * 3.0f, y1), IM_COL32(255, 222, 40, static_cast<int>(alpha * 255)));
++    }
++
++    const float textY = y0 + (rowHeight - textSize) * 0.5f - textSize * 0.04f;
++    if (entry.hasAttacker) {
++        DrawText(list, textSize, ImVec2(x0 + pad, textY), alpha, entry.attacker.text);
++    }
++    const float iconX = x0 + attackerWidth + pad * 0.5f;
++    const float iconY = y0 + (rowHeight - iconSize) * 0.5f;
++    const size_t item = static_cast<size_t>(entry.item);
++    if (g_iconTexture && g_iconLoaded[item]) {
++        const float u0 = float(item * kIconSize) / kIconAtlasWidth, u1 = float((item + 1) * kIconSize) / kIconAtlasWidth;
++        list->AddImage(g_iconTexture, ImVec2(iconX, iconY), ImVec2(iconX + iconSize, iconY + iconSize),
++                       ImVec2(u0, 0.0f), ImVec2(u1, 1.0f), IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
++    } else {
++        list->AddCircleFilled(ImVec2(iconX + iconSize * 0.5f, iconY + iconSize * 0.5f), iconSize * 0.3f,
++                              IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
++    }
++    if (!entry.victim.text.empty()) {
++        DrawText(list, textSize, ImVec2(x0 + attackerWidth + iconSlot + pad, textY), alpha, entry.victim.text);
++    }
++}
++
++} // namespace
++
++// ---------------------------------------------------------------------------------------------
++// Native replacements of the hit-counting leaves
++
++// lwz r0,4(r3); lis r3,0x809c; addi r3,r3,0x2f48; mulli r0,r0,116; add r3,r3,r0; lbz r3,89(r3)
++extern "C" void ItemObjectHitFlag_HLE_807a2234(CpuContext* ctx) {
++    const uint32_t item = ctx->gpr[3];
++    const uint32_t type = Memory::Read32(item + 4);
++    const uint32_t r0 = type * 116u;
++    ctx->gpr[0] = r0;
++    ctx->gpr[3] = Memory::Read8(0x809C2F48u + r0 + 89u);
++    if (ctx->lr == kItemObjectHitLr && type < kItemCount &&
++        std::find(kHiddenItems.begin(), kHiddenItems.end(), static_cast<Item>(type)) == kHiddenItems.end()) {
++        // Called only after Damage::SetDamage accepted the hit. r23 = ItemObj owner, r24 = victim.
++        const uint32_t owner = ctx->gpr[23] & 0xFF, victim = ctx->gpr[24] & 0xFF;
++        Guarded([&] { AddEntry(owner, victim, static_cast<Item>(type)); });
++    }
++}
++
++// IncrementItemStat only changes r0, r3, r4 and cr0; the hooks read the caller's other registers.
++extern "C" void IncrementItemsHitCount_HLE_805918bc(CpuContext* ctx) {
++    const uint32_t proxy = ctx->gpr[3];
++    IncrementItemStat(ctx, 8);
++    Guarded([&] { OnHitDelivered(ctx, proxy); });
++}
++
++extern "C" void IncrementItemsCollisionCount_HLE_805918e0(CpuContext* ctx) {
++    const uint32_t proxy = ctx->gpr[3];
++    IncrementItemStat(ctx, 12);
++    Guarded([&] { OnHitReceived(ctx, proxy); });
++}
++
++PPC_NATIVE_OVERRIDE_VOID(807A2234, ItemObjectHitFlag_HLE_807a2234, (CpuContext* ctx), (ctx));
++PPC_NATIVE_OVERRIDE_VOID(805918BC, IncrementItemsHitCount_HLE_805918bc, (CpuContext* ctx), (ctx));
++PPC_NATIVE_OVERRIDE_VOID(805918E0, IncrementItemsCollisionCount_HLE_805918e0, (CpuContext* ctx), (ctx));
++
++// ---------------------------------------------------------------------------------------------
++
++namespace kill_feed {
++
++void InstallSettingEntry() noexcept {
++    try {
++        const uint32_t target = kSettingEntries + kRoomCodeLowSetting * kSettingEntrySize;
++        const uint32_t source = kSettingEntries + kVanillaModeSetting * kSettingEntrySize;
++        auto nameIs = [](uint32_t entry, std::string_view expected) {
++            if (Memory::Read32(entry + 4) != expected.size()) return false;
++            const uint32_t text = Memory::Read32(entry + 8);
++            for (size_t i = 0; i < expected.size(); ++i) {
++                if (Memory::Read8(text + static_cast<uint32_t>(i)) != static_cast<uint8_t>(expected[i])) return false;
++            }
++            return true;
++        };
++        // Layout checks: the converted payload must be the one this was written against.
++        if (Memory::Read32(kDataBlock) != kDataMagic || !nameIs(target, "RoomCodeLow") || Memory::Read32(target + 20) != 0 ||
++            !nameIs(source, "VanillaMode") || Memory::Read32(source + 20) != 2) {
++            std::cout << "[killfeed] MKW-SP settings layout not recognised (block 0x" << std::hex << Memory::Read32(kDataBlock)
++                      << ", slot 54 name len " << Memory::Read32(target + 4) << " count " << Memory::Read32(target + 20)
++                      << ", slot 3 name len " << Memory::Read32(source + 4) << " count " << Memory::Read32(source + 20) << std::dec
++                      << "); Kill Feed has no settings entry (always on)" << std::endl;
++            return;
++        }
++        // RoomCodeLow only served mkw-sp.com friend rooms (offline). Reuse it as an Enable/Disable
++        // Race setting cloned from VanillaMode (same value names and "Disable"/"Enable" texts).
++        for (uint32_t offset = 0; offset < kSettingEntrySize; offset += 4) {
++            Memory::Write32(target + offset, Memory::Read32(source + offset));
++        }
++        Memory::Write32(target + 4, 8);                                  // name: "KillFeed"
++        Memory::Write32(target + 8, kDataBlock + 16);
++        Memory::Write32(target + 12, Memory::Read32(kDataBlock + 12));   // title message
++        Memory::Write32(target + 16, 1);                                 // default: Enable
++        Memory::Write32(target + 36, kDataBlock + 4);                    // value explanations
++        Memory::Write8(target + 44, 0);                                  // no vanilla-mode override
++        Memory::Write8(target + 48, 0);                                  // visible
++        g_settingInstalled = true;
++        std::cout << "[killfeed] Settings > Race > Kill Feed installed (setting slot " << kRoomCodeLowSetting << ")" << std::endl;
++    } catch (const Memory::AccessViolation& e) {
++        std::cout << "[killfeed] could not install the settings entry (guest access at 0x" << std::hex << e.address() << std::dec << ")" << std::endl;
++    }
++}
++
++void Draw() noexcept {
++    // MKWSP_KILLFEED_PREVIEW=1 shows sample rows on any screen (layout checks without a race).
++    static const bool preview = std::getenv("MKWSP_KILLFEED_PREVIEW") != nullptr;
++    if (preview) {
++        std::lock_guard lock(g_mutex);
++        const auto now = Clock::now();
++        if (g_entries.empty() || now - g_entries.back().born > std::chrono::milliseconds(1500)) {
++            struct Sample { const char* attacker; Tint at; bool local; Item item; const char* victim; Tint vt; };
++            static const Sample kSamples[] = {
++                {"Player", Tint::Ally, true, Item::RedShell, "Funky Kong", Tint::Enemy},
++                {"Bowser", Tint::Enemy, false, Item::Banana, "Peach", Tint::Enemy},
++                {"Wario", Tint::Enemy, false, Item::Bomb, "Toad", Tint::Enemy},
++                {"Wario", Tint::Enemy, false, Item::Bomb, "Player", Tint::Ally},
++                {"Player", Tint::Ally, true, Item::Star, "Toad", Tint::Enemy},
++                {"Daisy", Tint::Enemy, false, Item::BlueShell, "Player", Tint::Ally},
++                {"", Tint::Neutral, false, Item::Bomb, "King Boo", Tint::Enemy},
++                {"Luigi", Tint::Enemy, false, Item::Bullet, "Yoshi", Tint::Enemy},
++                {"Rosalina", Tint::Enemy, false, Item::GreenShell, "Mario", Tint::Enemy},
++            };
++            static size_t next = 0;
++            const Sample& s = kSamples[next++ % std::size(kSamples)];
++            Entry entry;
++            entry.id = g_nextId++;
++            entry.item = s.item;
++            entry.born = now;
++            entry.hasAttacker = s.attacker[0] != '\0';
++            entry.attacker = Side{s.attacker, s.at, s.local};
++            entry.victim = Side{s.victim, s.vt, std::string_view(s.victim) == "Player"};
++            g_entries.push_back(std::move(entry));
++        }
++    }
++    uint32_t raceInfo = 0;
++    if (!preview && (!Memory::TryRead32(kRaceInfoInstance, raceInfo) || raceInfo == 0 || !ReadSettingEnabled())) {
++        std::lock_guard lock(g_mutex);
++        g_entries.clear();
++        return;
++    }
++    const auto now = Clock::now();
++    std::lock_guard lock(g_mutex);
++    while (!g_entries.empty() && now - g_entries.front().born >= kEntryLifetime) {
++        g_entries.pop_front();
++    }
++    if (g_entries.empty()) {
++        return;
++    }
++    if (!g_fontTried) LoadFont();
++    if (!g_iconsTried) LoadIcons();
++
++    ImVec2 origin, size;
++    GameRect(origin, size);
++    // MKW's race HUD scales with the screen height and hugs the right edge: the timer's right
++    // edge sits ~0.11 heights from it and the lap counter ends ~0.26 heights down.
++    const float rowHeight = std::round(size.y * 0.036f);
++    const float right = origin.x + size.x - size.y * 0.105f;
++    float top = origin.y + size.y * 0.285f;
++    ImDrawList* list = ImGui::GetBackgroundDrawList();
++    const size_t first = g_entries.size() > kMaxEntries ? g_entries.size() - kMaxEntries : 0;
++    for (size_t i = first; i < g_entries.size(); ++i) {
++        DrawEntry(list, g_entries[i], right, top, rowHeight, now);
++        top += rowHeight * 1.14f;
++    }
++}
++
++} // namespace kill_feed

@@ -1,0 +1,11 @@
+texture_replacements/
+work/
+MKW-SP Live/
+*.zip
+__pycache__/
+tools/miifit/cache/
+tools/miifit/targets/
+tools/miifit/*.json
+!tools/miifit/calibration.json
+!tools/miifit/countries.json
+!tools/miifit/country_names.json
