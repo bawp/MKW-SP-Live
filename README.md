@@ -32,6 +32,7 @@ Download the latest kit from [Releases](../../releases) and follow its `README.t
 | `kit/` | The kit's build script, launcher, patch applier and SD card maker, and its README |
 | `patches/` | The changes to WiiCompiled's runtime: MKW-SP support, kill feed, rankings and esports |
 | `tools/` | The MKW-SP to Kamek converter, the Mario Kart Channel UI, texture tools, and `miifit` (fits Wii Miis to Mii Studio pictures) |
+| `assets/` | Extended Regions v1.2: every country's flag, the layouts that show them, and the country names |
 | `DEVELOPMENT.md` | How the port works, in detail |
 
 ## Credits
